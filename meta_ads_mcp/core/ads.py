@@ -917,6 +917,96 @@ async def get_ad_image(ad_id: str, access_token: Optional[str] = None) -> Image:
 
 @mcp_server.tool()
 @meta_api_tool
+async def get_ad_image_base64(ad_id: str, access_token: Optional[str] = None) -> str:
+    """
+    Get a Meta ad image as a base64-encoded JPEG string.
+    Unlike get_ad_image (which returns an Image object for visual display),
+    this returns the raw base64 text so it can be stored in cache or embedded in HTML.
+
+    Args:
+        ad_id: Meta Ads ad ID
+        access_token: Meta API access token (optional)
+
+    Returns:
+        JSON string with {"ad_id", "image_hash", "base64", "width", "height"} or error message
+    """
+    import base64 as b64module
+
+    if not ad_id:
+        return json.dumps({"error": "No ad ID provided"})
+
+    # 1) creative_id + account_id
+    ad_data = await make_api_request(ad_id, access_token, {"fields": "creative{id},account_id"})
+    if "error" in ad_data:
+        return json.dumps({"error": f"ad lookup failed: {ad_data}"})
+
+    account_id = ad_data.get("account_id", "")
+    creative_id = (ad_data.get("creative") or {}).get("id")
+    if not account_id or not creative_id:
+        return json.dumps({"error": "No account_id or creative_id"})
+
+    # 2) image_hash
+    creative_details = await make_api_request(creative_id, access_token, {"fields": "id,image_hash,asset_feed_spec"})
+    image_hash = creative_details.get("image_hash")
+    if not image_hash:
+        afs = creative_details.get("asset_feed_spec", {})
+        imgs = afs.get("images", [])
+        if imgs and "hash" in imgs[0]:
+            image_hash = imgs[0]["hash"]
+
+    image_url = None
+    width = height = 0
+
+    if image_hash:
+        # 3a) adimages endpoint
+        img_data = await make_api_request(
+            f"act_{account_id}/adimages", access_token,
+            {"fields": "hash,url,width,height", "hashes": f'["{image_hash}"]'}
+        )
+        items = img_data.get("data", [])
+        if items:
+            image_url = items[0].get("url")
+            width = items[0].get("width", 0)
+            height = items[0].get("height", 0)
+
+    if not image_url:
+        # 3b) fallback: get_ad_creatives → image_url / thumbnail_url
+        cjson = await get_ad_creatives(access_token=access_token, ad_id=ad_id)
+        cdata = json.loads(cjson)
+        for c in (cdata.get("data") or []):
+            if c.get("image_url"):
+                image_url = c["image_url"]; break
+            if c.get("thumbnail_url"):
+                image_url = c["thumbnail_url"]; break
+
+    if not image_url:
+        return json.dumps({"error": "No image URL found", "ad_id": ad_id})
+
+    # 4) download + encode
+    image_bytes = await download_image(image_url)
+    if not image_bytes:
+        return json.dumps({"error": "Download failed", "ad_id": ad_id})
+
+    try:
+        img = PILImage.open(io.BytesIO(image_bytes))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        encoded = b64module.b64encode(buf.getvalue()).decode("ascii")
+        return json.dumps({
+            "ad_id": ad_id,
+            "image_hash": image_hash or "",
+            "base64": encoded,
+            "width": width or img.width,
+            "height": height or img.height
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e), "ad_id": ad_id})
+
+
+@mcp_server.tool()
+@meta_api_tool
 async def get_ad_video(ad_id: str = "", video_id: str = "", account_id: str = "", access_token: Optional[str] = None) -> str:
     """
     Get video details and source URL for a Meta ad video creative. Returns the video source URL
